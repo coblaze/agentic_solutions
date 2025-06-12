@@ -1,0 +1,150 @@
+Here is what you have to know (and do) if you also want every timestamp field to become “right now” before you load the data back into MongoDB.
+
+────────────────────────────────────────
+
+
+Decide how you are going to re-insert ──────────────────────────────────────── A. Re-insert with Python / PyMongo
+• You control the connection from the same script that edits the documents.
+• You can keep timestamp as a real Python datetime object; the driver converts it to the BSON Date type for you.
+
+B. Re-insert with mongoimport or Compass “Import File”
+
+• You must serialize the timestamp into MongoDB Extended JSON so that mongoimport/Compass know it is a Date, not a plain string.
+
+• The easiest way is to let bson.json_util (which ships with PyMongo) do that for you.
+
+Pick whichever variant looks simpler for you below.
+
+────────────────────────────────────────
+2. Variant A – one-stop Python script (edit + insert)
+────────────────────────────────────────
+
+python
+
+# anonymise_and_insert.py
+import json
+from faker import Faker
+from datetime import datetime, timezone
+from pathlib import Path
+from pymongo import MongoClient
+
+fake = Faker()
+now = datetime.now(timezone.utc)
+
+IN_FILE        = Path("export.json")
+MONGO_URI      = "mongodb://localhost:27017"
+DB_NAME        = "myDB"
+COLLECTION     = "myCollection"
+
+# ---------- 1. Load ----------
+with IN_FILE.open() as f:
+    docs = json.load(f)      # or iterate line-by-line for JSON-Lines
+
+# ---------- 2. Transform ----------
+for d in docs:
+    d['accountNumber'] = fake.unique.random_number(digits=12, fix_len=True)
+    d['customerName']  = fake.name()
+    d['timestamp']     = now          # <── current instant as real datetime
+    d.pop('_id', None)                # drop old _id
+
+# ---------- 3. Insert ----------
+client = MongoClient(MONGO_URI)
+coll   = client[DB_NAME][COLLECTION]
+result = coll.insert_many(docs)
+print(f"Inserted {len(result.inserted_ids)} documents")
+Nothing else to worry about: the driver turns datetime into BSON Date automatically.
+
+────────────────────────────────────────
+3. Variant B – keep a JSON file and import with mongoimport / Compass
+────────────────────────────────────────
+Key point: MongoDB’s import tools look for Extended-JSON when they decide a field is a Date.
+
+bson.json_util.dumps() does that for you.
+
+python
+
+# anonymise_for_import.py
+import json, pathlib
+from faker import Faker
+from datetime import datetime, timezone
+from bson.json_util import dumps   # part of PyMongo
+
+fake      = Faker()
+now       = datetime.now(timezone.utc)
+IN_FILE   = pathlib.Path("export.json")
+OUT_FILE  = pathlib.Path("export_fake.json")
+
+docs = json.load(IN_FILE.open())     # or stream if huge
+
+for d in docs:
+    d['accountNumber'] = fake.unique.random_number(digits=12, fix_len=True)
+    d['customerName']  = fake.name()
+    d['timestamp']     = now
+    d.pop('_id', None)
+
+# dumps() ⇒ Extended JSON, so mongoimport/Compass see proper Date
+OUT_FILE.write_text(dumps(docs, indent=2))
+print(f"Ready for import: {OUT_FILE}")
+What does one document look like after this?
+
+code
+
+{
+  "accountNumber": 865024973114,
+  "customerName": "Alicia Ortega",
+  "timestamp": { "$date": "2025-06-12T12:57:41.123Z" },
+  ...
+}
+mongoimport command (array file):
+
+code
+
+mongoimport --uri "mongodb://localhost:27017" \
+            --db myDB --collection myCollection \
+            --file export_fake.json --jsonArray
+Compass: “Add Data → Import File → JSON Array”.
+
+────────────────────────────────────────
+4. Extra: nested timestamp fields or different names
+────────────────────────────────────────
+Use the small recursive helper once and handle all occurrences:
+
+python
+
+from faker import Faker
+from datetime import datetime, timezone
+fake = Faker()
+now  = datetime.now(timezone.utc)
+
+def recurse(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'accountNumber':
+                obj[k] = fake.unique.random_number(digits=12, fix_len=True)
+            elif k == 'customerName':
+                obj[k] = fake.name()
+            elif k == 'timestamp':
+                obj[k] = now
+            else:
+                recurse(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            recurse(item)
+Call recurse(doc) for every document, then proceed exactly as in variant A or B.
+
+────────────────────────────────────────
+5. Quick checklist before you import
+────────────────────────────────────────
+
+
+_id removed or regenerated?
+
+accountNumber still unique if a unique index exists?
+
+timestamp is a Date (not a string) ⇢ use Extended-JSON or PyMongo.
+
+File format matches the flag you pass (--jsonArray vs one-document-per-line).
+
+Large files → prefer mongoimport; Compass keeps everything in browser memory.
+
+That’s all you need to add the “current date” requirement to the previous workflow.

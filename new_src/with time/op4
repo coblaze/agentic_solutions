@@ -1,0 +1,397 @@
+I'll modify the solution to handle timestamp updates along with the account number and customer name changes. Here's the enhanced version:
+
+Updated Anonymization Script with Timestamp Handling
+python
+
+import json
+from faker import Faker
+from datetime import datetime, timedelta
+import random
+from pymongo import MongoClient
+
+class MongoDataProcessor:
+    def __init__(self, connection_string, db_name, collection_name):
+        self.faker = Faker()
+        self.client = MongoClient(connection_string)
+        self.db = self.client[db_name]
+        self.collection = self.db[collection_name]
+    
+    def anonymize_and_insert(self, input_file, timestamp_strategy='current'):
+        """
+        Anonymize data and insert into MongoDB
+        
+        timestamp_strategy options:
+        - 'current': Set all timestamps to current datetime
+        - 'today': Set all timestamps to today at various times
+        - 'recent': Set timestamps to random times within last 7 days
+        - 'preserve_pattern': Keep relative time differences but shift to recent dates
+        """
+        print("Step 1: Loading and anonymizing data...")
+        anonymized_data = self._anonymize_data(input_file, timestamp_strategy)
+        
+        print("\nStep 2: Validating data...")
+        if not self._validate_data(anonymized_data):
+            print("Validation failed. Aborting insertion.")
+            return
+        
+        print("\nStep 3: Inserting data...")
+        try:
+            # Remove _id fields to let MongoDB generate new ones
+            for doc in anonymized_data:
+                doc.pop('_id', None)
+            
+            result = self.collection.insert_many(anonymized_data)
+            print(f"Successfully inserted {len(result.inserted_ids)} documents")
+            
+            # Save anonymized data for reference
+            with open('anonymized_backup.json', 'w') as f:
+                json.dump(anonymized_data, f, indent=2, default=str)
+            print("Anonymized data backed up to anonymized_backup.json")
+            
+        except Exception as e:
+            print(f"Error during insertion: {e}")
+    
+    def _anonymize_data(self, input_file, timestamp_strategy):
+        with open(input_file, 'r') as f:
+            data = json.load(f)
+        
+        if not isinstance(data, list):
+            data = [data]
+        
+        customer_map = {}
+        account_map = {}
+        timestamp_count = 0
+        
+        # For preserve_pattern strategy
+        original_timestamps = []
+        
+        def parse_timestamp(value):
+            """Parse various timestamp formats"""
+            if isinstance(value, (int, float)):
+                # Unix timestamp
+                return datetime.fromtimestamp(value)
+            elif isinstance(value, str):
+                # Try common formats
+                formats = [
+                    '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%dT%H:%M:%S',
+                    '%Y-%m-%dT%H:%M:%S.%fZ',
+                    '%Y-%m-%dT%H:%M:%S.%f',
+                    '%Y/%m/%d %H:%M:%S',
+                ]
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(value, fmt)
+                    except ValueError:
+                        continue
+            return None
+        
+        def generate_new_timestamp(original_value, index):
+            """Generate new timestamp based on strategy"""
+            if timestamp_strategy == 'current':
+                return datetime.now()
+            
+            elif timestamp_strategy == 'today':
+                # Distribute throughout today
+                base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                hours_offset = (index * 24) // len(data)  # Distribute across 24 hours
+                return base + timedelta(hours=hours_offset, 
+                                      minutes=random.randint(0, 59),
+                                      seconds=random.randint(0, 59))
+            
+            elif timestamp_strategy == 'recent':
+                # Random time within last 7 days
+                days_ago = random.randint(0, 7)
+                return datetime.now() - timedelta(
+                    days=days_ago,
+                    hours=random.randint(0, 23),
+                    minutes=random.randint(0, 59),
+                    seconds=random.randint(0, 59)
+                )
+            
+            elif timestamp_strategy == 'preserve_pattern':
+                # First pass: collect all timestamps
+                if not original_timestamps:
+                    return None  # Will be set in second pass
+                
+                # Calculate relative position and map to recent timeframe
+                parsed = parse_timestamp(original_value)
+                if parsed and original_timestamps:
+                    min_time = min(original_timestamps)
+                    max_time = max(original_timestamps)
+                    if max_time > min_time:
+                        # Map to last 7 days
+                        time_range = (max_time - min_time).total_seconds()
+                        relative_pos = (parsed - min_time).total_seconds() / time_range
+                        new_start = datetime.now() - timedelta(days=7)
+                        return new_start + timedelta(seconds=relative_pos * 7 * 24 * 3600)
+                
+                return datetime.now()
+            
+            return datetime.now()
+        
+        # First pass for preserve_pattern: collect timestamps
+        if timestamp_strategy == 'preserve_pattern':
+            def collect_timestamps(obj):
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if key == 'timestamp' and value:
+                            parsed = parse_timestamp(value)
+                            if parsed:
+                                original_timestamps.append(parsed)
+                        elif isinstance(value, (dict, list)):
+                            collect_timestamps(value)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        collect_timestamps(item)
+            
+            collect_timestamps(data)
+        
+        # Main anonymization pass
+        doc_index = 0
+        
+        def anonymize_recursive(obj):
+            nonlocal doc_index, timestamp_count
+            
+            if isinstance(obj, dict):
+                # Track if this is a root document
+                is_root_doc = 'accountNumber' in obj or 'customerName' in obj
+                
+                for key, value in obj.items():
+                    if key == 'customerName' and value:
+                        if value not in customer_map:
+                            customer_map[value] = self.faker.name()
+                        obj[key] = customer_map[value]
+                    
+                    elif key == 'accountNumber' and value:
+                        if value not in account_map:
+                            account_map[value] = str(self.faker.random_number(digits=10, fix_len=True))
+                        obj[key] = account_map[value]
+                    
+                    elif key == 'timestamp':
+                        new_timestamp = generate_new_timestamp(value, doc_index)
+                        if new_timestamp:
+                            # Convert to MongoDB-friendly format
+                            obj[key] = new_timestamp
+                            timestamp_count += 1
+                    
+                    elif isinstance(value, (dict, list)):
+                        anonymize_recursive(value)
+                
+                if is_root_doc:
+                    doc_index += 1
+                    
+            elif isinstance(obj, list):
+                for item in obj:
+                    anonymize_recursive(item)
+        
+        anonymize_recursive(data)
+        
+        print(f"Anonymized {len(customer_map)} unique customer names")
+        print(f"Anonymized {len(account_map)} unique account numbers")
+        print(f"Updated {timestamp_count} timestamps using strategy: {timestamp_strategy}")
+        
+        return data
+    
+    def _validate_data(self, data):
+        print(f"Validating {len(data)} documents...")
+        
+        required_fields = ['accountNumber', 'customerName']
+        invalid_docs = []
+        
+        for i, doc in enumerate(data):
+            missing = [f for f in required_fields if f not in doc or doc[f] is None]
+            if missing:
+                invalid_docs.append((i, missing))
+            
+            # Check if timestamp is valid datetime object
+            if 'timestamp' in doc and not isinstance(doc['timestamp'], datetime):
+                print(f"Warning: Document {i} has invalid timestamp format")
+        
+        if invalid_docs:
+            print(f"Found {len(invalid_docs)} invalid documents")
+            for doc_idx, missing_fields in invalid_docs[:5]:
+                print(f"  Document {doc_idx} missing: {missing_fields}")
+            return False
+        
+        print("All documents valid!")
+        return True
+
+
+# Standalone function for simple anonymization
+def quick_anonymize_json(input_file, output_file, timestamp_strategy='current'):
+    """
+    Quick function to anonymize JSON file without MongoDB insertion
+    """
+    fake = Faker()
+    
+    with open(input_file, 'r') as f:
+        data = json.load(f)
+    
+    if not isinstance(data, list):
+        data = [data]
+    
+    customer_map = {}
+    account_map = {}
+    
+    for i, doc in enumerate(data):
+        # Walk through the document
+        def process_item(item):
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    if key == 'customerName' and value:
+                        if value not in customer_map:
+                            customer_map[value] = fake.name()
+                        item[key] = customer_map[value]
+                    
+                    elif key == 'accountNumber' and value:
+                        if value not in account_map:
+                            account_map[value] = str(fake.random_number(digits=10, fix_len=True))
+                        item[key] = account_map[value]
+                    
+                    elif key == 'timestamp':
+                        if timestamp_strategy == 'current':
+                            # Current datetime as ISO string
+                            item[key] = datetime.now().isoformat()
+                        elif timestamp_strategy == 'today':
+                            # Today with random time
+                            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                            random_time = today + timedelta(
+                                hours=random.randint(0, 23),
+                                minutes=random.randint(0, 59),
+                                seconds=random.randint(0, 59)
+                            )
+                            item[key] = random_time.isoformat()
+                        elif timestamp_strategy == 'recent':
+                            # Within last 7 days
+                            days_ago = random.randint(0, 7)
+                            recent_time = datetime.now() - timedelta(
+                                days=days_ago,
+                                hours=random.randint(0, 23),
+                                minutes=random.randint(0, 59)
+                            )
+                            item[key] = recent_time.isoformat()
+                    
+                    elif isinstance(value, (dict, list)):
+                        process_item(value)
+            
+            elif isinstance(item, list):
+                for element in item:
+                    process_item(element)
+        
+        process_item(doc)
+    
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"Anonymized data saved to {output_file}")
+    print(f"Customer names changed: {len(customer_map)}")
+    print(f"Account numbers changed: {len(account_map)}")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Option 1: Quick anonymization without MongoDB
+    quick_anonymize_json(
+        'original_data.json', 
+        'anonymized_data.json',
+        timestamp_strategy='recent'  # or 'current' or 'today'
+    )
+    
+    # Option 2: Full processing with MongoDB insertion
+    processor = MongoDataProcessor(
+        connection_string="mongodb://localhost:27017/",
+        db_name="your_database",
+        collection_name="your_collection"
+    )
+    
+    # Choose your timestamp strategy:
+    # - 'current': All timestamps = now
+    # - 'today': All timestamps = today at different times
+    # - 'recent': Random timestamps within last 7 days
+    # - 'preserve_pattern': Keep relative time differences
+    processor.anonymize_and_insert('original_data.json', timestamp_strategy='recent')
+Example: Handling Different Timestamp Formats
+If your JSON has timestamps in different formats, here's a specialized handler:
+
+python
+
+def smart_timestamp_replacer(timestamp_value, strategy='current'):
+    """
+    Intelligently replace timestamps regardless of their format
+    Returns a datetime object
+    """
+    current_time = datetime.now()
+    
+    # Handle different timestamp formats
+    if timestamp_value is None:
+        return current_time
+    
+    # Unix timestamp (seconds or milliseconds)
+    if isinstance(timestamp_value, (int, float)):
+        # Check if milliseconds (13 digits) or seconds (10 digits)
+        if timestamp_value > 1e10:
+            timestamp_value = timestamp_value / 1000
+        original = datetime.fromtimestamp(timestamp_value)
+    
+    # ISO string format
+    elif isinstance(timestamp_value, str):
+        try:
+            # Remove 'Z' suffix if present
+            if timestamp_value.endswith('Z'):
+                timestamp_value = timestamp_value[:-1]
+            
+            # Try parsing
+            original = datetime.fromisoformat(timestamp_value)
+        except:
+            # Fallback to current time if parsing fails
+            original = current_time
+    
+    # MongoDB ISODate or datetime object
+    elif isinstance(timestamp_value, datetime):
+        original = timestamp_value
+    
+    else:
+        original = current_time
+    
+    # Apply strategy
+    if strategy == 'current':
+        return current_time
+    elif strategy == 'today':
+        return current_time.replace(
+            hour=random.randint(0, 23),
+            minute=random.randint(0, 59),
+            second=random.randint(0, 59)
+        )
+    elif strategy == 'recent':
+        days_offset = random.randint(0, 7)
+        return current_time - timedelta(days=days_offset, 
+                                      hours=random.randint(0, 23),
+                                      minutes=random.randint(0, 59))
+    
+    return current_time
+MongoDB Compass Considerations
+When using MongoDB Compass to import the anonymized JSON:
+
+
+Timestamp Format: MongoDB prefers ISODate format. The script above handles this automatically when inserting via Python.
+
+
+For Compass Import, ensure your timestamps are in ISO format:
+
+
+json
+
+{
+  "accountNumber": "1234567890",
+  "customerName": "John Doe",
+  "timestamp": "2024-01-15T10:30:00.000Z"
+}
+
+Bulk Import Settings in Compass:
+Click "Add Data" → "Import File"
+Select your JSON file
+Ensure "JSON" is selected as the format
+Check the preview to ensure timestamps are recognized correctly
+
+Would you like me to add any other timestamp manipulation features, such as maintaining time zones or adding random variations to make the data look more realistic?

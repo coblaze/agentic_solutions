@@ -1,0 +1,165 @@
+TODO WITHOUT TIMESTAMP
+Below is a “cookbook” that lets you
+
+read an exported JSON file,
+
+replace every accountNumber and customerName with realistic-looking fakes, and
+
+re-insert the documents into an existing MongoDB collection without surprises.
+
+
+You can copy/paste the snippets, adapt a few variables, and be done.
+────────────────────────────────────────
+
+What does your export look like? ──────────────────────────────────────── MongoDB tools (mongoexport, Compass “Export Collection …”) produce one of two formats:
+
+
+A. JSON array in one file
+
+
+[
+{ "_id": { "$oid": "64e4…" }, "accountNumber": 123…, "customerName": "John …", … },
+{ … },
+…
+]
+B. “JSON-Lines” / “Extended JSON” (one document per line)
+
+
+{ "_id" : { "$oid" : "64e4…" }, "accountNumber" : … }
+{ "_id" : { "$oid" : "64e4…" }, "accountNumber" : … }
+…
+You only need to know which of the two you have so you can pick the matching loader below.
+────────────────────────────────────────
+2. Python script to anonymise the file
+────────────────────────────────────────
+Requirements (once):
+pip install faker pymongo tqdm ijson  # ijson only if you stream very large files
+Script (works for up to a few GB; keeps the full array in memory. A streaming version is shown afterwards):
+python
+# anonymise.py
+import json
+from faker import Faker
+from pathlib import Path
+from bson import ObjectId   # pip install pymongo gives you this
+
+fake = Faker()
+fake.add_provider(Faker)     # not strictly needed, but keeps linters happy
+
+IN_FILE  = Path("export.json")
+OUT_FILE = Path("export_fake.json")
+
+with IN_FILE.open() as f:
+    docs = json.load(f)          # <-- use json.loads(line) line-by-line for JSON-Lines
+
+for d in docs:
+    d['accountNumber'] = fake.unique.random_number(digits=12, fix_len=True)
+    d['customerName']  = fake.name()
+
+    # If you plan to re-insert into the *same* collection, drop the old _id
+    # so that MongoDB creates a new one and you avoid duplicate-key errors.
+    d.pop('_id', None)
+
+with OUT_FILE.open('w') as f:
+    json.dump(docs, f, indent=2)  # write back as a JSON array
+print(f"Wrote {len(docs)} documents to {OUT_FILE}")
+
+Streaming version (handles virtually unlimited files, keeps only one document in RAM):
+python
+import ijson, json, uuid, itertools, pathlib
+from faker import Faker
+fake = Faker()
+
+in_path  = pathlib.Path("export.json")
+out_path = pathlib.Path("export_fake.json")
+
+with in_path.open() as inf, out_path.open("w") as outf:
+    parser = ijson.items(inf, 'item')   # walks every element in the top-level array
+    outf.write("[\n")
+    first = True
+    for doc in parser:
+        doc['accountNumber'] = fake.unique.random_number(digits=12, fix_len=True)
+        doc['customerName']  = fake.name()
+        doc.pop('_id', None)
+
+        if not first:
+            outf.write(",\n")
+        first = False
+        json.dump(doc, outf)
+    outf.write("\n]\n")
+
+Nested keys?
+
+
+If accountNumber/customerName can be buried anywhere, add a small recursive helper:
+python
+def recurse(obj):
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if k == 'accountNumber': obj[k] = fake.unique.random_number(digits=12, fix_len=True)
+            elif k == 'customerName': obj[k] = fake.name()
+            else: recurse(v)
+    elif isinstance(obj, list):
+        for item in obj: recurse(item)
+
+Then call recurse(doc) for every document.
+────────────────────────────────────────
+3. Importing back into MongoDB
+────────────────────────────────────────
+Option 1 – Compass GUI
+
+Choose your DB / collection.
+
+“Add Data” ➜ “Import File”.
+
+Select the file you just produced.
+
+Tell Compass the file type (Compass guesses; make sure it shows “JSON Array” if you wrote an array).
+
+Compass will insert each array element as its own document. It never inserts the whole array as a single document.
+
+
+Option 2 – mongoimport CLI (bulk & script-able)
+code
+mongoimport \
+  --uri "mongodb://localhost:27017" \
+  --db  myDB \
+  --collection myCollection \
+  --file export_fake.json \
+  --jsonArray             # remove if you switched to JSON-Lines
+
+Add --drop in front of --collection if you want to wipe the collection first.
+────────────────────────────────────────
+4. Checks before you hit “Import”
+────────────────────────────────────────
+
+_id field
+
+
+• Keeping the old _id while inserting into the same collection ⇒ DuplicateKey error.
+
+
+• Either delete it (shown above) or generate a new one (doc['_id']=ObjectId()).
+
+Unique indexes
+
+
+If accountNumber had a unique index originally, make sure you are generating unique fakes (faker.unique… handles that).
+
+Schema validation / BSON types
+
+
+The faker fields must keep the type expected by any validator. E.g., if accountNumber was a number, don’t turn it into a string of digits. (fake.random_number returns int.)
+
+Collection size / quotas
+
+
+• Compass reads the whole file into memory; for huge datasets use mongoimport.
+
+
+• WiredTiger has a 16MB max document size, but each of your documents was already valid, so no change needed.
+
+Transactions / write concern (optional)
+
+
+In production you might want --writeConcern '{"w": "majority"}' or run mongoimport inside a session.
+
