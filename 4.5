@@ -1,84 +1,165 @@
-# anonymise.py
 import json
 from faker import Faker
-from pathlib import Path
+import re
 
-fake = Faker()
-
-# Input and output file paths
-FILE1_IN = Path("file1.json")
-FILE2_IN = Path("file2.json")
-FILE1_OUT = Path("file1_out.json")
-FILE2_OUT = Path("file2_out.json")
-
-# Suffix to append to specified fields
-SUFFIX = "--CO"
-# Keys to which SUFFIX should be appended
-TARGET_KEYS = ["ucid", "interactionId", "transaction_id", "CCID"]
-
-
-def recurse_append(obj):
-    """
-    Recursively append SUFFIX to all TARGET_KEYS and to all '$oid' strings.
-    """
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in TARGET_KEYS and isinstance(v, str):
-                obj[k] = v + SUFFIX
-            elif k == '$oid' and isinstance(v, str):
-                obj[k] = v + SUFFIX
-            else:
-                recurse_append(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            recurse_append(item)
-
-
-def main():
-    # Load JSON files
-    docs1 = json.loads(FILE1_IN.read_text())
-    docs2 = json.loads(FILE2_IN.read_text())
-
-    # Build mapping from original transcriptRefid to new values
-    mapping = {}
-    for d in docs1:
-        orig_oid = d.get("transcriptRefid", {}).get("$oid")
-        if not orig_oid:
-            continue
-        # Generate fake accountNumber and customerName
-        new_account = fake.unique.random_number(digits=16, fix_len=True)
-        new_name = fake.name()
-        d["accountNumber"] = str(new_account)
-        d["customerName"] = new_name
-
-        # Append suffix to specified fields and transcriptRefid
-        recurse_append(d)
-
-        # Record mapping
-        new_oid = d["transcriptRefid"]["$oid"]
-        mapping[orig_oid] = {
-            "new_oid": new_oid,
-            "new_account": d["accountNumber"],
-            "new_name": new_name
+class DualFileProcessor:
+    def __init__(self):
+        self.faker = Faker()
+        self.account_map = {}  # Original -> Fake account mapping
+        self.customer_map = {}  # Original -> Fake customer mapping
+        self.oid_map = {}  # Original OID -> Modified OID mapping
+        
+    def process_files(self, file1_path, file2_path, output_file1='modified_file1.json', output_file2='modified_file2.json'):
+        """Process both files according to the requirements"""
+        
+        # Step 1: Load both files
+        print("Loading files...")
+        with open(file1_path, 'r') as f:
+            file1_data = json.load(f)
+        with open(file2_path, 'r') as f:
+            file2_data = json.load(f)
+            
+        # Ensure both are lists
+        if not isinstance(file1_data, list):
+            file1_data = [file1_data]
+        if not isinstance(file2_data, list):
+            file2_data = [file2_data]
+            
+        # Step 2: Process file1 first to build mappings
+        print("\nProcessing file1...")
+        self._process_file1(file1_data)
+        
+        # Step 3: Process file2 using the mappings from file1
+        print("\nProcessing file2...")
+        self._process_file2(file2_data)
+        
+        # Step 4: Save modified files
+        print("\nSaving modified files...")
+        with open(output_file1, 'w') as f:
+            json.dump(file1_data, f, indent=2)
+        with open(output_file2, 'w') as f:
+            json.dump(file2_data, f, indent=2)
+            
+        # Step 5: Save mappings for reference
+        self._save_mappings()
+        
+        print(f"\nProcessing complete!")
+        print(f"Modified file1 saved as: {output_file1}")
+        print(f"Modified file2 saved as: {output_file2}")
+        print(f"Mappings saved as: mappings_reference.json")
+        
+    def _process_file1(self, data):
+        """Process file1: append --CO and create mappings"""
+        
+        fields_to_append = ['ucid', 'interactionId', 'transaction_id', 'CCID']
+        
+        for doc in data:
+            # Append --CO to specified fields
+            for field in fields_to_append:
+                if field in doc and doc[field] and isinstance(doc[field], str):
+                    doc[field] = doc[field] + "--CO"
+            
+            # Handle accountNumber
+            if 'accountNumber' in doc and doc['accountNumber']:
+                original_account = doc['accountNumber']
+                if original_account not in self.account_map:
+                    # Generate 16-digit account number
+                    self.account_map[original_account] = str(self.faker.random_number(digits=16, fix_len=True))
+                doc['accountNumber'] = self.account_map[original_account]
+            
+            # Handle customerName
+            if 'customerName' in doc and doc['customerName']:
+                original_name = doc['customerName']
+                if original_name not in self.customer_map:
+                    self.customer_map[original_name] = self.faker.name()
+                doc['customerName'] = self.customer_map[original_name]
+            
+            # Handle transcriptRefid.$oid
+            if 'transcriptRefid' in doc and isinstance(doc['transcriptRefid'], dict):
+                if '$oid' in doc['transcriptRefid'] and doc['transcriptRefid']['$oid']:
+                    original_oid = doc['transcriptRefid']['$oid']
+                    modified_oid = original_oid + "--CO"
+                    doc['transcriptRefid']['$oid'] = modified_oid
+                    self.oid_map[original_oid] = modified_oid
+            
+            # Also check for nested structures
+            self._process_nested_fields(doc)
+    
+    def _process_nested_fields(self, obj, append_co=True):
+        """Recursively process nested fields"""
+        fields_to_append = ['ucid', 'interactionId', 'transaction_id', 'CCID']
+        
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if append_co and key in fields_to_append and isinstance(value, str):
+                    obj[key] = value + "--CO" if not value.endswith("--CO") else value
+                elif isinstance(value, (dict, list)):
+                    self._process_nested_fields(value, append_co)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._process_nested_fields(item, append_co)
+    
+    def _process_file2(self, data):
+        """Process file2 using mappings from file1"""
+        
+        for doc in data:
+            # Handle _id.$oid to match transcriptRefid.$oid from file1
+            if '_id' in doc and isinstance(doc['_id'], dict) and '$oid' in doc['_id']:
+                original_oid = doc['_id']['$oid']
+                if original_oid in self.oid_map:
+                    doc['_id']['$oid'] = self.oid_map[original_oid]
+                else:
+                    # If not in map, just append --CO
+                    doc['_id']['$oid'] = original_oid + "--CO"
+            
+            # Apply account number mapping
+            if 'accountNumber' in doc and doc['accountNumber'] in self.account_map:
+                doc['accountNumber'] = self.account_map[doc['accountNumber']]
+            
+            # Apply customer name mapping
+            if 'customerName' in doc and doc['customerName'] in self.customer_map:
+                doc['customerName'] = self.customer_map[doc['customerName']]
+            
+            # Process any nested structures for account/customer replacements
+            self._apply_mappings_to_nested(doc)
+    
+    def _apply_mappings_to_nested(self, obj):
+        """Apply account and customer mappings to nested fields"""
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key == 'accountNumber' and value in self.account_map:
+                    obj[key] = self.account_map[value]
+                elif key == 'customerName' and value in self.customer_map:
+                    obj[key] = self.customer_map[value]
+                elif isinstance(value, (dict, list)):
+                    self._apply_mappings_to_nested(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._apply_mappings_to_nested(item)
+    
+    def _save_mappings(self):
+        """Save all mappings for reference"""
+        mappings = {
+            "account_mappings": self.account_map,
+            "customer_mappings": self.customer_map,
+            "oid_mappings": self.oid_map,
+            "total_accounts_changed": len(self.account_map),
+            "total_customers_changed": len(self.customer_map),
+            "total_oids_mapped": len(self.oid_map)
         }
-
-    # Apply updates to file2
-    for d in docs2:
-        oid = d.get("_id", {}).get("$oid")
-        if oid in mapping:
-            # Update document ID, accountNumber, and customerName
-            d["_id"]["$oid"] = mapping[oid]["new_oid"]
-            d["accountNumber"] = mapping[oid]["new_account"]
-            d["customerName"] = mapping[oid]["new_name"]
-
-            # Append suffix to other specified fields
-            recurse_append(d)
-
-    # Write out modified JSON
-    FILE1_OUT.write_text(json.dumps(docs1, indent=2))
-    FILE2_OUT.write_text(json.dumps(docs2, indent=2))
-    print(f"Wrote {len(docs1)} docs to {FILE1_OUT} and {len(docs2)} docs to {FILE2_OUT}")
+        
+        with open('mappings_reference.json', 'w') as f:
+            json.dump(mappings, f, indent=2)
 
 
+# Example usage
 if __name__ == "__main__":
-    main()
+    processor = DualFileProcessor()
+    
+    # Process the files
+    processor.process_files(
+        file1_path='file1.json',
+        file2_path='file2.json',
+        output_file1='file1_modified.json',
+        output_file2='file2_modified.json'
+    )
